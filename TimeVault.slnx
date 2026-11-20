@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="TimeVault.App/TimeVault.App.csproj" />
+  <Project Path="TimeVault.Core/TimeVault.Core.csproj" />
+</Solution>
