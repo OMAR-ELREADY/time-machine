@@ -1,331 +1,166 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading;
-// --- البيانات والنماذج المبدئية (ChangeType, ChangeEvent) ---
+using TimeVault.Core.DataStructures;
+using TimeVault.Core.Models;
 
-// --- هيكل البيانات: الطابور المشترك (LinkedQueue<T>) ---
-
-// --- العملية 1: تهيئة وتشغيل المراقب لكل مجلد (StartWatching) ---
-
-// --- العملية 2: استقبال الحدث الخام (OnFileCreated, OnFileChanged, OnFileDeleted, HandleRawEvent) ---
-
-// --- العملية 3: تهدئة الأحداث السريعة (Debounce / ForwardToDebounce) ---
-
-// --- العملية 4: إضافة الحدث إلى الطابور المشترك (EnqueueDebouncedEvent) ---
-
-// --- العملية 5: إيقاف المراقبة وتنظيف الموارد (StopWatching, StopAll, Dispose) ---
-
-namespace TimeVault.DataStructures
+namespace TimeVault.Core.Services.Watcher
 {
-    public class LinkedQueue<T>
+    public class WatcherService
     {
-        private class Node
+        private Dictionary<string, FileSystemWatcher> watchers;
+
+        private Dictionary<string, DateTime> lastEventTime;
+
+        private LinkedQueue<ChangeEvent> eventQueue;
+
+        private object lockObject = new object();
+
+        private const int DebounceMilliseconds = 500;
+        public WatcherService(LinkedQueue<ChangeEvent> queue)
         {
-            public T Value;
-            public Node Next;
-            public Node(T value) => Value = value;
+            eventQueue = queue;
+
+            watchers = new Dictionary<string, FileSystemWatcher>();
+            lastEventTime = new Dictionary<string, DateTime>();
         }
 
-        private Node _head;
-        private Node _tail;
-        private readonly object _lock = new object();
-
-        public int Count { get; private set; }
-
-        public bool IsEmpty
+        public void StartWatching(string folderPath)
         {
-            get
+            if (string.IsNullOrWhiteSpace(folderPath))
             {
-                lock (_lock)
-                {
-                    return Count == 0;
-                }
+                throw new ArgumentException("Folder path cannot be empty.");
             }
-        }
-
-        public void Enqueue(T item)
-        {
-            lock (_lock)
-            {
-                var newNode = new Node(item);
-                if (_tail == null)
-                {
-                    _head = _tail = newNode;
-                }
-                else
-                {
-                    _tail.Next = newNode;
-                    _tail = newNode;
-                }
-                Count++;
-            }
-        }
-
-        public bool TryDequeue(out T item)
-        {
-            lock (_lock)
-            {
-                if (_head == null)
-                {
-                    item = default;
-                    return false;
-                }
-
-                item = _head.Value;
-                _head = _head.Next;
-                if (_head == null)
-                {
-                    _tail = null;
-                }
-                Count--;
-                return true;
-            }
-        }
-    }
-}
-
-namespace TimeVault.Core
-{
-    using TimeVault.DataStructures;
-
-    public enum ChangeType
-    {
-        Created,
-        Modified,
-        Deleted
-    }
-
-    public class ChangeEvent
-    {
-        public string FolderId { get; set; }
-        public string FilePath { get; set; }
-        public ChangeType ChangeType { get; set; }
-        public DateTime OccurredAt { get; set; }
-    }
-
-    public class WatcherService : IDisposable
-    {
-        private readonly Dictionary<string, FileSystemWatcher> _watchers = new Dictionary<string, FileSystemWatcher>();
-        private readonly Dictionary<FileSystemWatcher, string> _watcherToFolderId = new Dictionary<FileSystemWatcher, string>();
-        private readonly Dictionary<string, string> _folderIdToPath = new Dictionary<string, string>();
-
-        // --- العملية الثالثة: قاموس مؤقتات التهدئة لكل مسار ملف، وفترة التهدئة بالمللي ثانية ---
-        private readonly ConcurrentDictionary<string, Timer> _debounceTimers = new ConcurrentDictionary<string, Timer>();
-        private readonly object _debounceLock = new object();
-        private readonly int _debounceDelayMs;
-
-        // --- العملية الرابعة: الطابور المشترك لاستقبال الأحداث بعد تهدئتها ---
-        private readonly LinkedQueue<ChangeEvent> _sharedEventQueue;
-
-        private bool _disposed;
-
-        public WatcherService(LinkedQueue<ChangeEvent> sharedEventQueue = null, int debounceDelayMs = 400)
-        {
-            _sharedEventQueue = sharedEventQueue ?? new LinkedQueue<ChangeEvent>();
-            _debounceDelayMs = debounceDelayMs;
-        }
-
-        public LinkedQueue<ChangeEvent> EventQueue => _sharedEventQueue;
-
-        // --- العملية الأولى: تهيئة وتشغيل المراقب لكل مجلد ---
-        public void StartWatching(string folderId, string folderPath, bool includeSubdirectories = true)
-        {
-            if (_disposed)
-                throw new ObjectDisposedException(nameof(WatcherService));
-
-            if (string.IsNullOrWhiteSpace(folderId) || string.IsNullOrWhiteSpace(folderPath))
-                throw new ArgumentException("معرف المجلد ومساره مطلوبان.");
 
             if (!Directory.Exists(folderPath))
-                throw new DirectoryNotFoundException($"المجلد غير موجود: {folderPath}");
-
-            if (_watchers.ContainsKey(folderId))
             {
-                StopWatching(folderId);
+                throw new DirectoryNotFoundException("Folder not found: " + folderPath);
             }
 
-            var watcher = new FileSystemWatcher(folderPath)
+            if (watchers.ContainsKey(folderPath))
             {
-                IncludeSubdirectories = includeSubdirectories,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
-            };
+                return;
+            }
 
-            watcher.Created += OnFileCreated;
-            watcher.Changed += OnFileChanged;
-            watcher.Deleted += OnFileDeleted;
+            FileSystemWatcher watcher = new FileSystemWatcher(folderPath);
+
+            watcher.IncludeSubdirectories = true;
+
+            watcher.NotifyFilter = NotifyFilters.FileName
+                                 | NotifyFilters.LastWrite
+                                 | NotifyFilters.Size;
+
+            watcher.Created += OnCreated;
+            watcher.Changed += OnChanged;
+            watcher.Deleted += OnDeleted;
+            watcher.Renamed += OnRenamed;
 
             watcher.EnableRaisingEvents = true;
 
-            _watchers[folderId] = watcher;
-            _watcherToFolderId[watcher] = folderId;
-            _folderIdToPath[folderId] = folderPath;
+            watchers.Add(folderPath, watcher);
         }
 
-        // --- العملية الخامسة: إيقاف المراقبة وتنظيف الموارد ---
-        public void StopWatching(string folderId)
+        public void StopWatching(string folderPath)
         {
-            if (string.IsNullOrWhiteSpace(folderId))
+            if (!watchers.ContainsKey(folderPath))
+            {
                 return;
-
-            if (_watchers.TryGetValue(folderId, out var watcher))
-            {
-                watcher.EnableRaisingEvents = false;
-                watcher.Created -= OnFileCreated;
-                watcher.Changed -= OnFileChanged;
-                watcher.Deleted -= OnFileDeleted;
-                _watcherToFolderId.Remove(watcher);
-                watcher.Dispose();
-                _watchers.Remove(folderId);
             }
 
-            // إلغاء وتنظيف مؤقتات التهدئة المرتبطة بمسار هذا المجلد إن وُجدت
-            if (_folderIdToPath.TryGetValue(folderId, out string folderPath))
-            {
-                CancelTimersUnderPath(folderPath);
-                _folderIdToPath.Remove(folderId);
-            }
+            FileSystemWatcher watcher = watchers[folderPath];
+
+            watcher.EnableRaisingEvents = false;
+            watcher.Dispose();
+
+            watchers.Remove(folderPath);
         }
 
         public void StopAll()
         {
-            var folderIds = new List<string>(_watchers.Keys);
-            foreach (var id in folderIds)
+            foreach (FileSystemWatcher watcher in watchers.Values)
             {
-                StopWatching(id);
+                watcher.EnableRaisingEvents = false;
+                watcher.Dispose();
             }
 
-            CancelAllTimers();
+            watchers.Clear();
         }
 
-        private void CancelTimersUnderPath(string folderPath)
+        private void OnCreated(object sender, FileSystemEventArgs e)
         {
-            if (string.IsNullOrWhiteSpace(folderPath))
-                return;
-
-            string normalizedFolder = Path.GetFullPath(folderPath).ToLowerInvariant();
-            if (!normalizedFolder.EndsWith(Path.DirectorySeparatorChar.ToString()))
+            if (Directory.Exists(e.FullPath))
             {
-                normalizedFolder += Path.DirectorySeparatorChar;
+                return;
             }
 
-            lock (_debounceLock)
+            AddEvent(e.FullPath, ChangeType.Created, null);
+        }
+
+        private void OnChanged(object sender, FileSystemEventArgs e)
+        {
+            if (Directory.Exists(e.FullPath))
             {
-                foreach (var key in new List<string>(_debounceTimers.Keys))
+                return;
+            }
+
+            AddEvent(e.FullPath, ChangeType.Modified, null);
+        }
+
+        private void OnDeleted(object sender, FileSystemEventArgs e)
+        {
+            AddEvent(e.FullPath, ChangeType.Deleted, null);
+        }
+
+        private void OnRenamed(object sender, RenamedEventArgs e)
+        {
+            if (Directory.Exists(e.FullPath))
+            {
+                return;
+            }
+
+            AddEvent(e.FullPath, ChangeType.Renamed, e.OldFullPath);
+        }
+
+        private void AddEvent(string filePath, ChangeType type, string oldPath)
+        {
+            lock (lockObject)
+            {
+                if (IsDuplicate(filePath, type))
                 {
-                    if (key.StartsWith(normalizedFolder) && _debounceTimers.TryRemove(key, out var timer))
-                    {
-                        timer.Dispose();
-                    }
-                }
-            }
-        }
-
-        private void CancelAllTimers()
-        {
-            lock (_debounceLock)
-            {
-                foreach (var key in new List<string>(_debounceTimers.Keys))
-                {
-                    if (_debounceTimers.TryRemove(key, out var timer))
-                    {
-                        timer.Dispose();
-                    }
-                }
-            }
-        }
-
-        public void Dispose()
-        {
-            if (_disposed)
-                return;
-
-            StopAll();
-            _disposed = true;
-            GC.SuppressFinalize(this);
-        }
-
-        // --- العملية الثانية: استقبال الحدث الخام ---
-        private void OnFileCreated(object sender, FileSystemEventArgs e)
-        {
-            if (_disposed) return;
-            HandleRawEvent(sender, e, ChangeType.Created);
-        }
-
-        private void OnFileChanged(object sender, FileSystemEventArgs e)
-        {
-            if (_disposed) return;
-            HandleRawEvent(sender, e, ChangeType.Modified);
-        }
-
-        private void OnFileDeleted(object sender, FileSystemEventArgs e)
-        {
-            if (_disposed) return;
-            HandleRawEvent(sender, e, ChangeType.Deleted);
-        }
-
-        private void HandleRawEvent(object sender, FileSystemEventArgs e, ChangeType changeType)
-        {
-            if (sender is not FileSystemWatcher watcher)
-                return;
-
-            if (!_watcherToFolderId.TryGetValue(watcher, out string folderId))
-                return;
-
-            if (changeType != ChangeType.Deleted && Directory.Exists(e.FullPath))
-                return;
-
-            var rawEvent = new ChangeEvent
-            {
-                FolderId = folderId,
-                FilePath = e.FullPath,
-                ChangeType = changeType,
-                OccurredAt = DateTime.Now
-            };
-
-            ForwardToDebounce(rawEvent);
-        }
-
-        // --- العملية الثالثة: تهدئة الأحداث السريعة (Debounce) ---
-        private void ForwardToDebounce(ChangeEvent rawEvent)
-        {
-            if (_disposed || string.IsNullOrWhiteSpace(rawEvent.FilePath))
-                return;
-
-            string key = rawEvent.FilePath.ToLowerInvariant();
-
-            lock (_debounceLock)
-            {
-                if (_debounceTimers.TryRemove(key, out var existingTimer))
-                {
-                    existingTimer.Dispose();
+                    return;
                 }
 
-                var timer = new Timer(_ =>
-                {
-                    if (_disposed)
-                        return;
+                ChangeEvent changeEvent = new ChangeEvent();
 
-                    if (_debounceTimers.TryRemove(key, out var completedTimer))
-                    {
-                        completedTimer.Dispose();
-                    }
+                // Fill it with the information.
+                changeEvent.FilePath = filePath;
+                changeEvent.OldPath = oldPath;
+                changeEvent.Type = type;
+                changeEvent.Time = DateTime.Now;
 
-                    EnqueueDebouncedEvent(rawEvent);
-                }, null, _debounceDelayMs, Timeout.Infinite);
-
-                _debounceTimers[key] = timer;
+                eventQueue.Enqueue(changeEvent);
             }
         }
 
-        // --- العملية الرابعة: إضافة الحدث إلى الطابور المشترك ---
-        private void EnqueueDebouncedEvent(ChangeEvent debouncedEvent)
+        private bool IsDuplicate(string filePath, ChangeType type)
         {
-            if (_disposed || debouncedEvent == null)
-                return;
+            string key = type + "|" + filePath;
 
-            _sharedEventQueue.Enqueue(debouncedEvent);
+            DateTime now = DateTime.Now;
+
+            if (lastEventTime.ContainsKey(key))
+            {
+                TimeSpan difference = now - lastEventTime[key];
+
+                if (difference.TotalMilliseconds < DebounceMilliseconds)
+                {
+                    return true;
+                }
+            }
+
+            lastEventTime[key] = now;
+
+            return false;
         }
     }
 }
